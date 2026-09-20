@@ -22,7 +22,7 @@ DEFAULT = {
     'stop_atr':2.0, 'target_atr':4.0, 'fee_pct':0.40, 'slippage_pct':0.05,
     'paper_cash':1000.0, 'live_trading':False, 'running':False, 'allow_shorts':True, 'short_leverage':2, 'margin_mode':'cross',
     'position':None, 'pending_order':None, 'last_scan':[], 'last_signal':None, 'last_error':None,
-    'trades':[], 'starting_equity':1000.0
+    'trades':[], 'starting_equity':1000.0, 'goal_active':False, 'goal_start_gbp':10.0, 'goal_target_gbp':100.0, 'goal_started_at':None, 'goal_note':''
 }
 STATE_FILE=BASE/'bot_state.json'
 state=json.loads(json.dumps(DEFAULT))
@@ -426,18 +426,17 @@ def exchange_position_guard():
     try:
         existing = kraken.open_non_usdt_positions()
         margin = kraken.fetch_margin_positions()
-        # Any meaningful non-USDT spot holding is existing exposure, regardless
-        # of whether that asset is in the scanner's configured universe.
+        # Any meaningful non-USDT Kraken exposure blocks a new bot entry,
+        # even when the asset is outside the scanner whitelist.
         for p in existing:
             if float(p.get('amount') or 0) > 0:
                 return True
         for p in margin:
-            if p.get('symbol'):
-                try:
-                    if abs(float(p.get('contracts') or 0)) > 0 or abs(float(p.get('notional') or 0)) > 0:
-                        return True
-                except Exception:
-                    continue
+            try:
+                if abs(float(p.get('contracts') or 0)) > 0 or abs(float(p.get('notional') or 0)) > 0:
+                    return True
+            except Exception:
+                continue
     except Exception as e:
         state['last_error'] = f'Live position guard failed: {e}'
         save()
@@ -462,29 +461,18 @@ def reconcile_existing_positions():
     state['account_reconciliation_ok']=True
     candidates=[]
 
-    # Treat every meaningful non-USDT spot holding as existing exposure, not just
-    # symbols in the scanner universe.  This is deliberately separate from the
-    # trading universe: an unexpected/manual holding must never be mistaken for
-    # permission to open another trade. Dust is still ignored by
-    # KrakenClient.open_non_usdt_positions().
+    # Spot balances are treated as LONG positions only when they are worth
+    # more than the configured dust threshold.
     for p in positions:
-        qty=float(p.get('amount') or 0)
-        if qty <= 0:
-            continue
-        symbol=p.get('symbol')
-        current=state.get('position') or {}
-        candidates.append({
-            'symbol':symbol or p.get('asset'),
-            'side':'LONG','amount':qty,
-            'asset':p.get('asset'),
-            'entry':float(current.get('entry') or 0) if current.get('symbol') in {symbol,p.get('asset')} else 0,
-            'source':'spot',
-            'market_known':bool(symbol),
-        })
+        if p.get('symbol') or p.get('asset'):
+            candidates.append({
+                'symbol':p['symbol'],'side':'LONG','amount':p['amount'],
+                'entry':state.get('position',{}).get('entry',0) if state.get('position',{}).get('symbol')==p['symbol'] else 0,
+                'source':'spot'
+            })
 
     # Margin positions represent either long or short exposure. Prefer these
-    # when available because they carry direction and entry price. Do not filter
-    # to the scanner universe: any real Kraken exposure blocks new entries.
+    # when available because they carry direction and entry price.
     for p in margin_positions:
         sym=p.get('symbol')
         if not sym:
@@ -501,16 +489,23 @@ def reconcile_existing_positions():
             'leverage':int(state.get('short_leverage',2))
         })
 
-    # Deduplicate same symbol/asset, preferring margin information.
+    # Deduplicate same symbol, preferring margin information.
     dedup={}
     for p in candidates:
-        key=str(p.get('symbol') or p.get('asset') or '').upper()
-        if not key:
-            continue
-        if key not in dedup or p.get('source')=='margin':
-            dedup[key]=p
+        dedup[p['symbol']]=p
     candidates=list(dedup.values())
     state['existing_positions']=candidates
+
+    # Unknown/manual non-USDT balances still count as exposure. They may not
+    # have a tradable scanner symbol, but they must not be silently ignored.
+    unknown_assets = [p for p in positions if not p.get('symbol') and float(p.get('amount') or 0) > 0]
+    if unknown_assets:
+        asset = str(unknown_assets[0].get('asset') or 'UNKNOWN')
+        state['position']=None
+        state['position_locked']=True
+        state['locked_symbol']=asset
+        state['position_lock_reason']='Existing Kraken exposure detected; no new trade until all non-USDT exposure is closed.'
+        save(); return True
 
     if len(candidates) > 1:
         state['position']=None
@@ -522,18 +517,9 @@ def reconcile_existing_positions():
     if candidates:
         selected=candidates[0]
         current=state.get('position') or {}
-        selected_symbol=selected.get('symbol')
-        # Unknown/manual assets are still exposure and therefore still lock new
-        # entries, but they cannot be managed by the Keltner strategy.
-        if not selected_symbol or '/' not in str(selected_symbol):
-            state['position']=None
-            state['position_locked']=True
-            state['locked_symbol']=selected.get('asset') or 'UNKNOWN'
-            state['position_lock_reason']='Existing Kraken exposure detected; no new trade until all non-USDT exposure is closed.'
-            save(); return True
         entry=float(selected.get('entry') or current.get('entry') or 0)
         if entry<=0:
-            try: entry=float(kraken.ticker(selected_symbol)['last'])
+            try: entry=float(kraken.ticker(selected['symbol'])['last'])
             except Exception: entry=0
         atr=float(current.get('atr') or 0)
         if atr<=0:
@@ -828,9 +814,9 @@ def live_control():
         if confirmation != 'I_UNDERSTAND_REAL_ORDERS':
             return jsonify({'ok':False,'armed':False,'error':'Enter I_UNDERSTAND_REAL_ORDERS to arm live trading'}),400
         try:
-            # A zero/missing USDT balance must not prevent the bot from arming.
-            # The private balance call is used only to authenticate the API key;
-            # trade sizing will decide later whether there is enough quote balance.
+            # Authentication is enough to arm. A zero/missing USDT balance
+            # must not prevent startup; sizing will decide whether an entry is
+            # affordable once the scanner finds a setup.
             kraken.balance()
         except Exception as e:
             msg = str(e)
@@ -842,6 +828,29 @@ def live_control():
         state['live_trading']=False
     save()
     return jsonify({'ok':True,'armed':armed()})
+
+@app.post('/api/goal/start')
+def start_goal():
+    """Start the £10→£100 goal tracker and start the normal bot worker.
+
+    The goal control does not replace or bypass the existing Keltner sizing,
+    Kraken safety gates, TP/SL protection, or existing-position lock.
+    """
+    state['goal_active']=True
+    state['goal_start_gbp']=10.0
+    state['goal_target_gbp']=100.0
+    state['goal_started_at']=now()
+    state['goal_note']='Goal tracking active: existing Kraken exposure still blocks new entries.'
+    state['running']=True
+    save()
+    return jsonify({'ok':True,'goal_active':True,'running':True,'start_gbp':10.0,'target_gbp':100.0})
+
+@app.post('/api/goal/stop')
+def stop_goal():
+    state['goal_active']=False
+    state['goal_note']=''
+    save()
+    return jsonify({'ok':True,'goal_active':False})
 
 @app.post('/api/settings')
 def settings():
