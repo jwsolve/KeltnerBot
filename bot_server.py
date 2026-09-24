@@ -9,7 +9,8 @@ from strategy import signal, indicators, backtest
 from database import DB
 
 BASE = Path(__file__).resolve().parent
-load_dotenv(BASE / '.env')
+ENV_FILE = BASE / '.env'
+load_dotenv(ENV_FILE)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 
 ALLOWED_SYMBOLS = ['USDC/USDT', 'ALGO/USDT', 'APE/USDT', 'AVAX/USDT', 'BERA/USDT', 'BTC/USDT', 'BCH/USDT', 'BNB/USDT', 'CC/USDT', 'ADA/USDT', 'LINK/USDT', 'DOGE/USDT', 'ETH/USDT', 'LTC/USDT', 'SHIB/USDT', 'SOL/USDT', 'TON/USDT', 'TRUMP/USDT', 'XTZ/USDT', 'XRP/USDT']
@@ -35,14 +36,44 @@ state['quotes'] = ['USDT']
 state.setdefault('scanner_status', {p:{'action':'HOLD','reason':'Waiting for scan','score':0} for p in ALLOWED_SYMBOLS})
 state.setdefault('selected_pair', None)
 state.setdefault('pending_order', None)
+state.setdefault('position_locked', False)
+state.setdefault('locked_symbol', None)
+state.setdefault('position_lock_reason', '')
 lock=threading.RLock(); kraken=KrakenClient(); db=DB(BASE/'trading.db')
 
 
 def now(): return datetime.now(timezone.utc).isoformat()
 def save():
     with lock: STATE_FILE.write_text(json.dumps(state,indent=2,default=str))
+
+
+# -------- Live-arming helpers (FIX 1) --------
+def _env_true(name, default=False):
+    """Return True if env var is set to a truthy value, tolerant of case/whitespace."""
+    val = os.getenv(name)
+    if val is None:
+        return default
+    return val.strip().lower() in ('1', 'true', 'yes', 'on', 'y')
+
+def _arm_diagnostic():
+    """Return (ok, reason) describing why armed() is or isn't True."""
+    if not state.get('live_trading'):
+        return False, 'UI switch is off (state.live_trading=False). Toggle "Arm live trading" and confirm.'
+    if not ENV_FILE.exists():
+        return False, f'.env file not found at {ENV_FILE}'
+    if not _env_true('LIVE_TRADING'):
+        return False, f'LIVE_TRADING in .env must be exactly "true" (got {os.getenv("LIVE_TRADING")!r})'
+    if os.getenv('LIVE_CONFIRM', '').strip() != 'I_UNDERSTAND_REAL_ORDERS':
+        return False, f'LIVE_CONFIRM in .env must be exactly "I_UNDERSTAND_REAL_ORDERS" (got {os.getenv("LIVE_CONFIRM")!r})'
+    if not os.getenv('KRAKEN_API_KEY', '').strip():
+        return False, 'KRAKEN_API_KEY is missing or empty in .env'
+    if not os.getenv('KRAKEN_API_SECRET', '').strip():
+        return False, 'KRAKEN_API_SECRET is missing or empty in .env'
+    return True, 'armed'
+
 def armed():
-    return bool(state.get('live_trading')) and os.getenv('LIVE_TRADING','false').lower()=='true' and os.getenv('LIVE_CONFIRM')=='I_UNDERSTAND_REAL_ORDERS' and bool(os.getenv('KRAKEN_API_KEY')) and bool(os.getenv('KRAKEN_API_SECRET'))
+    ok, _ = _arm_diagnostic()
+    return ok
 
 
 def quote_currency(symbol): return symbol.split('/')[1]
@@ -68,7 +99,6 @@ def account():
 
 
 def record(side,symbol,amount,price,reason,order=None):
-    # Keep one stable schema for the persistent log and the browser table.
     row={
         'ts':now(), 'time':now(), 'symbol':symbol, 'side':side, 'action':side,
         'amount':float(amount), 'price':float(price), 'reason':reason,
@@ -82,7 +112,6 @@ def order_snapshot(order_id, symbol):
     return kraken.order(order_id, symbol)
 
 def reconcile_pending():
-    """Reconcile a previously submitted live order without creating duplicate orders."""
     po=state.get('pending_order')
     if not po or not armed(): return None
     try:
@@ -110,7 +139,6 @@ def reconcile_pending():
     return None
 
 def submit_live(side,symbol,amount,price,atr,reason,direction='LONG'):
-    """Submit a live long or short Kraken order and persist its lifecycle."""
     if state.get('pending_order'):
         reconcile_pending()
         return None
@@ -118,8 +146,6 @@ def submit_live(side,symbol,amount,price,atr,reason,direction='LONG'):
     direction = direction.upper()
     lev = max(1, int(state.get('short_leverage', 2)))
     if direction == 'SHORT':
-        # Kraken REST Conditional Close supports one attached exit, not a true
-        # OCO pair. Do not place a live short with an orphanable second exit.
         raise RuntimeError(
             'Live SHORT temporarily disabled: Kraken REST Conditional Close cannot '
             'atomically attach both TP and SL. Paper shorts remain available.'
@@ -175,9 +201,6 @@ def submit_live(side,symbol,amount,price,atr,reason,direction='LONG'):
                         'opened':po.get('created',now()),'order_id':oid,
                         'bracket_attached':True,'tp_order_id':None
                     }
-                # The Kraken entry carries the TP as a Conditional Close.
-                # Install the complementary LONG stop only after the fill is
-                # confirmed, so the stop quantity exactly matches the fill.
                 if direction == 'LONG':
                     sl = kraken.add_standalone_exit(
                         symbol, 'sell', filled_amt, 'stop-loss',
@@ -228,7 +251,7 @@ def buy(symbol, price, atr, reason):
         return False
     if armed():
         if state.get('position') or state.get('pending_order') or exchange_position_guard():
-            state['last_error'] = 'Live entry blocked: an existing Kraken position or pending order was detected.'
+            state['last_error'] = state.get('trading_locked_reason') or 'Live entry blocked: an existing Kraken position or pending order was detected.'
             save()
             return False
         o=submit_live('buy',symbol,amount,price,atr,reason,'LONG')
@@ -251,9 +274,6 @@ def short(symbol, price, atr, reason):
         save(); logging.exception('Account check failed before SHORT')
         return False
 
-    # Size from the same risk model as longs. For margin, the position notional
-    # is constrained by max_position_percent * equity, with leverage applied by
-    # Kraken to the required collateral rather than multiplying our risk size.
     amount=calculate_amount(symbol,price,atr,a['equity'])
     amount=kraken.amount(symbol,amount)
     if amount<=0 or amount<kraken.min_amount(symbol) or amount*price<kraken.min_cost(symbol):
@@ -274,8 +294,6 @@ def short(symbol, price, atr, reason):
             save(); logging.exception('Kraken SHORT failed')
             return False
 
-    # Paper short: reserve the notional as a liability but keep the original
-    # cash balance unchanged; PnL is realised when covered.
     state['position']={
         'symbol':symbol,'side':'SHORT','amount':amount,'entry':price,
         'stop':price+atr*float(state['stop_atr']),'target':price-atr*float(state['target_atr']),
@@ -285,7 +303,6 @@ def short(symbol, price, atr, reason):
     state['last_error']=None; save(); return True
 
 
-# Live BUYs carry Kraken-native TP/SL brackets, so the exchange can exit even if this process stops.
 def sell(reason, price=None):
     pos=state.get('position')
     if not pos: return False
@@ -340,7 +357,6 @@ def sell(reason, price=None):
 
 
 def scan():
-    """Scan the complete configured universe and rank both long and short setups."""
     rows=[]
     for symbol in ALLOWED_SYMBOLS:
         try:
@@ -380,7 +396,6 @@ def scan():
 
 
 def ensure_protective_orders():
-    """Verify TP/SL protection without stacking full-size exit orders."""
     if not armed(): return True
     pos=state.get('position')
     if not pos: return True
@@ -400,9 +415,6 @@ def ensure_protective_orders():
             for o in orders
         )
         pos['tp_present']=has_tp; pos['sl_present']=has_sl
-        # This is intentionally not called a single Kraken bracket: current
-        # REST Conditional Close is one-sided. The pair is exchange-resident
-        # as TP (attached) + SL (standalone).
         pos['bracket_present']=bool(has_tp and has_sl)
         pos['protective_checked']=now()
         if not (has_tp and has_sl):
@@ -415,40 +427,38 @@ def ensure_protective_orders():
         save(); logging.exception('Protective order verification failed'); return False
 
 
+# FIX 4: distinguish "guard failed" from "position detected"
 def exchange_position_guard():
-    """Never open a second live position on a symbol.
-
-    This checks both the bot state and Kraken balances/margin positions. Dust is
-    ignored by KrakenClient.open_non_usdt_positions().
-    """
     if not armed():
         return False
     try:
         existing = kraken.open_non_usdt_positions()
         margin = kraken.fetch_margin_positions()
-        # Any meaningful non-USDT Kraken exposure blocks a new bot entry,
-        # even when the asset is outside the scanner whitelist.
-        for p in existing:
-            if float(p.get('amount') or 0) > 0:
-                return True
-        for p in margin:
-            try:
-                if abs(float(p.get('contracts') or 0)) > 0 or abs(float(p.get('notional') or 0)) > 0:
-                    return True
-            except Exception:
-                continue
     except Exception as e:
-        state['last_error'] = f'Live position guard failed: {e}'
+        state['last_error'] = f'Live position guard could not verify Kraken exposure: {e}'
+        state['trading_locked_reason'] = 'Position guard unavailable — cannot safely open a live trade.'
         save()
         logging.exception('Live position guard failed')
-        # Fail closed: do not place a new live order when position state cannot
-        # be verified.
-        return True
+        return True  # fail closed
+    for p in existing:
+        try:
+            if float(p.get('amount') or 0) > 0:
+                state['trading_locked_reason'] = f"Existing non-USDT Kraken balance: {p.get('asset') or p.get('symbol')}"
+                return True
+        except Exception:
+            continue
+    for p in margin:
+        try:
+            if abs(float(p.get('contracts') or 0)) > 0 or abs(float(p.get('notional') or 0)) > 0:
+                state['trading_locked_reason'] = f"Existing margin position: {p.get('symbol')}"
+                return True
+        except Exception:
+            continue
+    state['trading_locked_reason'] = ''
     return False
 
 
 def reconcile_existing_positions():
-    """Rebuild bot position state from Kraken after a restart."""
     try:
         positions = kraken.open_non_usdt_positions()
         margin_positions = kraken.fetch_margin_positions() if armed() else []
@@ -461,8 +471,6 @@ def reconcile_existing_positions():
     state['account_reconciliation_ok']=True
     candidates=[]
 
-    # Spot balances are treated as LONG positions only when they are worth
-    # more than the configured dust threshold.
     for p in positions:
         if p.get('symbol') or p.get('asset'):
             candidates.append({
@@ -471,8 +479,6 @@ def reconcile_existing_positions():
                 'source':'spot'
             })
 
-    # Margin positions represent either long or short exposure. Prefer these
-    # when available because they carry direction and entry price.
     for p in margin_positions:
         sym=p.get('symbol')
         if not sym:
@@ -489,15 +495,12 @@ def reconcile_existing_positions():
             'leverage':int(state.get('short_leverage',2))
         })
 
-    # Deduplicate same symbol, preferring margin information.
     dedup={}
     for p in candidates:
         dedup[p['symbol']]=p
     candidates=list(dedup.values())
     state['existing_positions']=candidates
 
-    # Unknown/manual non-USDT balances still count as exposure. They may not
-    # have a tradable scanner symbol, but they must not be silently ignored.
     unknown_assets = [p for p in positions if not p.get('symbol') and float(p.get('amount') or 0) > 0]
     if unknown_assets:
         asset = str(unknown_assets[0].get('asset') or 'UNKNOWN')
@@ -553,8 +556,6 @@ def reconcile_existing_positions():
     save(); return True
 
 
-
-# This bot is intentionally LONG-ONLY. Never enable short execution.
 def cycle():
     state['allow_shorts'] = False
     try:
@@ -568,7 +569,6 @@ def cycle():
             if state.get('pending_order'):
                 state['last_scan_time']=now(); save(); return
 
-        # Repair a missing TP after restart or a transient Kraken/API error.
         if armed() and state.get('position'):
             if not ensure_protective_orders():
                 state['last_scan_time']=now(); save(); return
@@ -601,7 +601,7 @@ def cycle():
         else:
             if armed() and exchange_position_guard():
                 state['position_locked']=True
-                state['position_lock_reason']='Existing Kraken exposure detected; no new trade will be placed.'
+                state['position_lock_reason']=state.get('trading_locked_reason') or 'Existing Kraken exposure detected; no new trade will be placed.'
                 state['last_scan_time']=now(); save(); return
             entries=[x for x in rows if x['action'] in ('BUY','SHORT')]
             if not state.get('allow_shorts',True):
@@ -629,16 +629,22 @@ def worker():
 app=Flask(__name__,static_folder='web')
 @app.get('/')
 def index(): return send_from_directory(BASE/'web','index.html')
+
 @app.get('/api/state')
 def api_state():
     with lock:s=json.loads(json.dumps(state,default=str))
     try:s['account']=account()
     except Exception as e:s['account']={'error':str(e)}
-    s['live_armed']=armed(); return jsonify(s)
+    s['live_armed']=armed()
+    arm_ok, arm_reason = _arm_diagnostic()
+    s['live_arm_ok'] = arm_ok
+    s['live_arm_reason'] = arm_reason
+    s['env_file'] = str(ENV_FILE)
+    s['env_file_exists'] = ENV_FILE.exists()
+    return jsonify(s)
 
 @app.get('/api/recent_trades')
 def api_recent_trades():
-    """Read-only persistent recent fills from trading.db for the dashboard."""
     try:
         return jsonify({'ok':True,'source':'trading.db','trades':db.recent_fills(10)})
     except Exception as e:
@@ -647,13 +653,6 @@ def api_recent_trades():
 
 @app.get('/api/open_trades')
 def api_open_trades():
-    """Read-only Kraken reconciliation for dashboard display.
-
-    This endpoint deliberately does not touch live_trading, bot state, or order
-    placement. It reads current spot balances and Kraken's executed trade
-    history, then FIFO-matches buys against sells to show lots that still have
-    exposure. If history is unavailable, the current balance is still shown.
-    """
     if not os.getenv('KRAKEN_API_KEY') or not os.getenv('KRAKEN_API_SECRET'):
         return jsonify({'ok':False,'source':'Kraken','trades':[],'error':'Kraken API credentials are not configured'})
     try:
@@ -668,9 +667,6 @@ def api_open_trades():
         else:
             history_error = None
 
-        # Build FIFO lots from executed spot trades.  Kraken/CCXT may return
-        # fees in the base or quote currency; the executed amount is the only
-        # quantity used for position matching.
         lots = {}
         for t in sorted(history or [], key=lambda x: (x.get('timestamp') or 0, str(x.get('id') or ''))):
             symbol = t.get('symbol') or ''
@@ -699,8 +695,6 @@ def api_open_trades():
                     if bucket[0]['amount']<=1e-12:
                         bucket.pop(0)
 
-        # Find a usable USDT market for each non-USDT balance.  This is based
-        # on the actual Kraken market list, not the bot scanner whitelist.
         result=[]
         for asset, raw_total in total.items():
             asset_u=str(asset).upper()
@@ -716,8 +710,6 @@ def api_open_trades():
                 if cu in (f'{asset_u}/USDT', f'{asset_u}/USD'):
                     symbol=candidate; break
             if not symbol:
-                # Kraken can expose alternate asset codes. Try the bot's
-                # configured USDT universe as a final harmless lookup.
                 for candidate in ALLOWED_SYMBOLS:
                     if candidate.split('/')[0].upper()==asset_u:
                         symbol=candidate; break
@@ -731,7 +723,6 @@ def api_open_trades():
                 continue
 
             bucket=lots.get(asset_u, [])
-            # Reconcile FIFO-derived lots to the actual current wallet amount.
             open_lots=[]; remaining=qty
             for lot in bucket:
                 if remaining<=1e-12: break
@@ -739,8 +730,6 @@ def api_open_trades():
                 if take<=1e-12: continue
                 open_lots.append({**lot,'amount':take})
                 remaining-=take
-            # If trade history doesn't explain all of the current balance,
-            # retain a visible synthetic lot instead of hiding the exposure.
             if remaining>1e-12:
                 open_lots.append({'symbol':symbol,'amount':remaining,'entry':0.0,
                                   'cost':0.0,'time':None,'trade_id':None,'unknown_entry':True})
@@ -757,7 +746,6 @@ def api_open_trades():
                                'opened':lot.get('time'),'trade_id':lot.get('trade_id'),
                                'unknown_entry':bool(lot.get('unknown_entry',False))})
 
-        # Attach currently open TP/SL orders where possible. This is read-only.
         try:
             orders=kraken.open_orders() or []
         except Exception:
@@ -798,44 +786,58 @@ def api_balance():
 @app.get('/api/markets')
 def markets():
     q=request.args.get('quote','GBP'); return jsonify({'symbols':kraken.symbols(q,100)})
+
+# -------- FIX: verbose arming endpoint --------
 @app.post('/api/live')
 def live_control():
-    """Arm/disarm live trading from the UI, while retaining the .env safety gate."""
     d=request.get_json(force=True) or {}
     enable=bool(d.get('enabled'))
-    confirmation=str(d.get('confirmation',''))
+    confirmation=str(d.get('confirmation','')).strip()
     if enable:
-        if os.getenv('LIVE_TRADING','false').lower()!='true':
-            return jsonify({'ok':False,'armed':False,'error':'LIVE_TRADING=true is required in .env'}),400
-        if os.getenv('LIVE_CONFIRM')!='I_UNDERSTAND_REAL_ORDERS':
-            return jsonify({'ok':False,'armed':False,'error':'LIVE_CONFIRM is not set correctly in .env'}),400
-        if not os.getenv('KRAKEN_API_KEY') or not os.getenv('KRAKEN_API_SECRET'):
-            return jsonify({'ok':False,'armed':False,'error':'KRAKEN_API_KEY and KRAKEN_API_SECRET are required'}),400
+        # Pre-check the .env gates so the error message names the exact problem.
+        if not ENV_FILE.exists():
+            return jsonify({'ok':False,'armed':False,'error':f'.env file not found at {ENV_FILE}'}),400
+        if not _env_true('LIVE_TRADING'):
+            return jsonify({'ok':False,'armed':False,
+                'error':f'LIVE_TRADING in .env must be exactly "true" (got {os.getenv("LIVE_TRADING")!r})'}),400
+        if os.getenv('LIVE_CONFIRM','').strip() != 'I_UNDERSTAND_REAL_ORDERS':
+            return jsonify({'ok':False,'armed':False,
+                'error':f'LIVE_CONFIRM in .env must be exactly "I_UNDERSTAND_REAL_ORDERS" (got {os.getenv("LIVE_CONFIRM")!r})'}),400
+        if not os.getenv('KRAKEN_API_KEY','').strip() or not os.getenv('KRAKEN_API_SECRET','').strip():
+            return jsonify({'ok':False,'armed':False,
+                'error':'KRAKEN_API_KEY and KRAKEN_API_SECRET must both be set in .env'}),400
         if confirmation != 'I_UNDERSTAND_REAL_ORDERS':
-            return jsonify({'ok':False,'armed':False,'error':'Enter I_UNDERSTAND_REAL_ORDERS to arm live trading'}),400
+            return jsonify({'ok':False,'armed':False,
+                'error':'Type exactly I_UNDERSTAND_REAL_ORDERS in the confirmation box.'}),400
         try:
-            # Authentication is enough to arm. A zero/missing USDT balance
-            # must not prevent startup; sizing will decide whether an entry is
-            # affordable once the scanner finds a setup.
             kraken.balance()
         except Exception as e:
             msg = str(e)
             if 'Invalid nonce' in msg or 'EAPI:Invalid nonce' in msg:
-                msg += ' — the bot now uses a persistent monotonic microsecond nonce. Restart the bot after updating this version; do not use the same Kraken API key from another process at the same time.'
+                msg += ' — restart the bot after updating, and do not use the same Kraken API key from another process at the same time.'
             return jsonify({'ok':False,'armed':False,'error':f'Kraken authentication/balance check failed: {msg}'}),400
         state['live_trading']=True
     else:
         state['live_trading']=False
     save()
-    return jsonify({'ok':True,'armed':armed()})
+    ok, reason = _arm_diagnostic()
+    return jsonify({'ok':True,'armed':armed(),'arm_ok':ok,'arm_reason':reason})
+
+# -------- FIX: unlock endpoint --------
+@app.post('/api/unlock')
+def unlock():
+    """Clear a stale position lock so the bot can scan again after manual flattening."""
+    state['position_locked']=False
+    state['locked_symbol']=None
+    state['position_lock_reason']=''
+    state['trading_locked_reason']=''
+    state['last_error']=None
+    save()
+    logging.info('Position lock cleared by operator.')
+    return jsonify({'ok':True,'position_locked':False})
 
 @app.post('/api/goal/start')
 def start_goal():
-    """Start the £10→£100 goal tracker and start the normal bot worker.
-
-    The goal control does not replace or bypass the existing Keltner sizing,
-    Kraken safety gates, TP/SL protection, or existing-position lock.
-    """
     state['goal_active']=True
     state['goal_start_gbp']=10.0
     state['goal_target_gbp']=100.0
@@ -860,6 +862,7 @@ def settings():
             if k in allowed: state[k]=v
         save()
     return jsonify({'ok':True})
+
 @app.post('/api/start')
 def start(): state['running']=True; save(); return jsonify({'ok':True})
 @app.post('/api/stop')
@@ -895,5 +898,12 @@ def api_optimize():
     return jsonify({'best':best,'results':sorted(results,key=lambda x:x['return_pct'],reverse=True)[:30]})
 
 if __name__=='__main__':
+    # Startup diagnostics — makes it obvious why arming may be refused.
+    ok, reason = _arm_diagnostic()
+    logging.info('Startup: env file=%s exists=%s', ENV_FILE, ENV_FILE.exists())
+    logging.info('Startup: LIVE_TRADING=%r LIVE_CONFIRM=%r KEY_set=%s SECRET_set=%s',
+                 os.getenv('LIVE_TRADING'), os.getenv('LIVE_CONFIRM'),
+                 bool(os.getenv('KRAKEN_API_KEY')), bool(os.getenv('KRAKEN_API_SECRET')))
+    logging.info('Startup: arm preconditions ok=%s reason=%s', ok, reason)
     threading.Thread(target=worker,daemon=True).start()
     app.run(host=os.getenv('HOST','127.0.0.1'),port=int(os.getenv('PORT','8080')),debug=False)
